@@ -162,6 +162,16 @@ const FichaTemporadaSchema = new mongoose.Schema({
   jugadorReferente: String,
   talla: String,
 
+  horarioSalidaColegio: {
+    lunes: String,
+    martes: String,
+    miercoles: String,
+    jueves: String,
+    viernes: String,
+    sabado: String,
+    domingo: String,
+  },
+
   numerosFavoritos: [Number],
 
   nombreCamiseta: String,
