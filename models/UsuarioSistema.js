@@ -28,6 +28,8 @@ const UsuarioSistemaSchema = new mongoose.Schema({
   type: Boolean,
   default: true
   },
+  activacionToken: { type: String, default: null },
+  activacionExpira: { type: Date, default: null },
 });
 
 module.exports = mongoose.model('UsuarioSistema', UsuarioSistemaSchema);

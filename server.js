@@ -15,6 +15,7 @@ const UsuarioSistema = require('./models/UsuarioSistema');
 const bcrypt = require('bcrypt');
 const Asistencia = require('./models/Asistencia');
 const Rendimiento = require('./models/Rendimiento');
+const { enviarCorreoActivacionApoderado } = require('./mailer');
 
 if (!process.env.MONGODB_URI) {
   console.error('❌ Falta MONGODB_URI en las variables de entorno');
@@ -101,6 +102,42 @@ function validarLongitudes(campos) {
     return null;
   }
   return revisar(campos);
+}
+
+function calcularDigitoVerificadorRut(cuerpo) {
+  let suma = 0;
+  let multiplicador = 2;
+  for (let i = cuerpo.length - 1; i >= 0; i--) {
+    suma += parseInt(cuerpo[i], 10) * multiplicador;
+    multiplicador = multiplicador === 7 ? 2 : multiplicador + 1;
+  }
+  const resto = 11 - (suma % 11);
+  if (resto === 11) return '0';
+  if (resto === 10) return 'K';
+  return String(resto);
+}
+
+/* Valida un RUT chileno (dígito verificador incluido) y devuelve su forma normalizada
+   "12345678-9", o null si el formato o el dígito verificador son inválidos. */
+function validarYNormalizarRut(valor) {
+  const limpio = (valor || '').toString().replace(/[^0-9kK]/g, '').toUpperCase();
+  if (limpio.length < 2) return null;
+  const cuerpo = limpio.slice(0, -1);
+  const dv = limpio.slice(-1);
+  if (!/^\d{7,8}$/.test(cuerpo)) return null;
+  if (calcularDigitoVerificadorRut(cuerpo) !== dv) return null;
+  return `${cuerpo}-${dv}`;
+}
+
+/* Valida un número de celular/WhatsApp chileno y devuelve su forma normalizada
+   "+56 9 XXXX XXXX", o null si no calza con el formato esperado. */
+function validarYNormalizarWhatsapp(valor) {
+  if (!valor) return null;
+  let digitos = valor.toString().replace(/[^0-9]/g, '');
+  if (digitos.startsWith('56') && digitos.length === 11) digitos = digitos.slice(2);
+  if (digitos.length === 10 && digitos.startsWith('0')) digitos = digitos.slice(1);
+  if (digitos.length !== 9 || digitos[0] !== '9') return null;
+  return `+56 9 ${digitos.slice(1, 5)} ${digitos.slice(5)}`;
 }
 
 mongoose.connect(process.env.MONGODB_URI)
@@ -568,14 +605,24 @@ app.post('/ficha-temporada', limiteRegistro, async (req, res) => {
         .filter((n) => !isNaN(n));
     }
 
-    const normalizarRut = (r) => (r || '').toString().replace(/[^0-9kK]/g, '').toUpperCase();
-    const rutNuevo = normalizarRut(datos.cedula);
-    if (rutNuevo) {
-      const existentes = await FichaTemporada.find({ cedula: { $exists: true, $ne: '' } }).select('cedula');
-      const yaExiste = existentes.some(f => normalizarRut(f.cedula) === rutNuevo);
-      if (yaExiste) {
-        return res.status(409).json({ mensaje: 'Este jugador ya está registrado (RUT duplicado).' });
+    const rutNormalizado = validarYNormalizarRut(datos.cedula);
+    if (!rutNormalizado) {
+      return res.status(400).json({ mensaje: 'El RUT ingresado no es válido. Revísalo (formato esperado: 12345678-9).' });
+    }
+    datos.cedula = rutNormalizado;
+
+    if (datos.apoderado?.whatsapp) {
+      const whatsappNormalizado = validarYNormalizarWhatsapp(datos.apoderado.whatsapp);
+      if (!whatsappNormalizado) {
+        return res.status(400).json({ mensaje: 'El número de WhatsApp no es válido. Revísalo (formato esperado: +56 9 1234 5678).' });
       }
+      datos.apoderado.whatsapp = whatsappNormalizado;
+    }
+
+    const existentes = await FichaTemporada.find({ cedula: { $exists: true, $ne: '' } }).select('cedula');
+    const yaExiste = existentes.some(f => f.cedula === rutNormalizado);
+    if (yaExiste) {
+      return res.status(409).json({ mensaje: 'Este jugador ya está registrado (RUT duplicado).' });
     }
 
     const ficha = new FichaTemporada(datos);
@@ -624,6 +671,20 @@ app.put('/ficha-temporada/:id', verificarToken, soloAdmin, async (req, res) => {
     }
     if (typeof datos.numerosFavoritos === 'string') {
       datos.numerosFavoritos = datos.numerosFavoritos.split(',').map(n => Number(n.trim())).filter(n => !isNaN(n));
+    }
+    if (datos.cedula) {
+      const rutNormalizado = validarYNormalizarRut(datos.cedula);
+      if (!rutNormalizado) {
+        return res.status(400).json({ mensaje: 'El RUT ingresado no es válido. Revísalo (formato esperado: 12345678-9).' });
+      }
+      datos.cedula = rutNormalizado;
+    }
+    if (datos.apoderado?.whatsapp) {
+      const whatsappNormalizado = validarYNormalizarWhatsapp(datos.apoderado.whatsapp);
+      if (!whatsappNormalizado) {
+        return res.status(400).json({ mensaje: 'El número de WhatsApp no es válido. Revísalo (formato esperado: +56 9 1234 5678).' });
+      }
+      datos.apoderado.whatsapp = whatsappNormalizado;
     }
     const ficha = await FichaTemporada.findByIdAndUpdate(req.params.id, datos, { returnDocument: 'after', runValidators: false });
     if (!ficha) return res.status(404).json({ mensaje: 'Ficha no encontrada' });
@@ -779,6 +840,42 @@ app.post('/rendimientos', verificarToken, soloProfesor, async (req, res) => {
   }
 });
 
+/* Permite al profesor corregir una evaluación de rendimiento ya guardada (propia o de un
+   colega), siempre que el jugador esté dentro de sus divisiones/sede asignadas. */
+app.put('/rendimientos/:id', verificarToken, soloProfesor, async (req, res) => {
+  try {
+    const { fisico, tecnico, actitudinal, estrategico, comentario } = req.body;
+    if (!fisico || !tecnico || !actitudinal || !estrategico) {
+      return res.status(400).json({ mensaje: 'fisico, tecnico, actitudinal y estrategico son obligatorios' });
+    }
+
+    const existente = await Rendimiento.findById(req.params.id);
+    if (!existente) return res.status(404).json({ mensaje: 'Rendimiento no encontrado' });
+
+    const usuario = await UsuarioSistema.findById(req.user.id).populate('profesorId');
+    const permitido = usuario?.profesorId && await jugadorPerteneceAProfesor(existente.jugadorId, usuario.profesorId);
+    if (!permitido) return res.status(403).json({ mensaje: 'No tienes acceso a este jugador' });
+
+    const fProm = promedioCategoria(fisico);
+    const tProm = promedioCategoria(tecnico);
+    const aProm = promedioCategoria(actitudinal);
+    const eProm = promedioCategoria(estrategico);
+    const promedioGeneral = Math.round((fProm + tProm + aProm + eProm) / 4);
+
+    existente.fisico = { ...fisico, promedio: fProm };
+    existente.tecnico = { ...tecnico, promedio: tProm };
+    existente.actitudinal = { ...actitudinal, promedio: aProm };
+    existente.estrategico = { ...estrategico, promedio: eProm };
+    existente.promedioGeneral = promedioGeneral;
+    existente.comentario = comentario || '';
+    await existente.save();
+
+    res.json(existente);
+  } catch (e) {
+    res.status(500).json({ mensaje: 'Error al editar rendimiento' });
+  }
+});
+
 app.post('/profesores/crear-acceso', verificarToken, soloAdmin, async (req, res) => {
   try {
     let {
@@ -893,13 +990,41 @@ function crudRoutes(app, path, Model, middlewares = []) {
 
 crudRoutes(app, '/estudiantes', Estudiante, [soloAdmin]);
 
-/* DIVISIONES: solo lectura (protegido contra creación) */
+/* DIVISIONES */
 app.get('/divisiones', verificarToken, soloAdmin, async (req, res) => {
   try {
     res.json(await Division.find().sort({ createdAt: -1 }));
   }
   catch (e) {
     res.status(500).json({ mensaje: 'Error al obtener divisiones' });
+  }
+});
+
+app.post('/divisiones', verificarToken, soloAdmin, async (req, res) => {
+  try {
+    const division = await new Division(req.body).save();
+    res.status(201).json(division);
+  } catch (e) {
+    res.status(500).json({ mensaje: 'Error al crear división' });
+  }
+});
+
+app.put('/divisiones/:id', verificarToken, soloAdmin, async (req, res) => {
+  try {
+    const division = await Division.findByIdAndUpdate(req.params.id, req.body, { returnDocument: 'after', runValidators: true });
+    if (!division) return res.status(404).json({ mensaje: 'División no encontrada' });
+    res.json(division);
+  } catch (e) {
+    res.status(500).json({ mensaje: 'Error al actualizar división' });
+  }
+});
+
+app.delete('/divisiones/:id', verificarToken, soloAdmin, async (req, res) => {
+  try {
+    await Division.findByIdAndDelete(req.params.id);
+    res.json({ mensaje: 'División eliminada' });
+  } catch (e) {
+    res.status(500).json({ mensaje: 'Error al eliminar división' });
   }
 });
 
@@ -955,7 +1080,10 @@ app.put('/config', verificarToken, soloAdmin, async (req, res) => {
 app.get('/pagos', verificarToken, soloAdmin, async (req, res) => {
   try {
     const filtro = {};
-    if (req.query.estado) filtro.estado = req.query.estado;
+    if (req.query.estado) {
+      const estados = req.query.estado.split(',').map(e => e.trim()).filter(Boolean);
+      filtro.estado = estados.length > 1 ? { $in: estados } : estados[0];
+    }
     const pagos = await Pago.find(filtro).select('-voucherBase64').sort({ fechaRegistro: -1 });
     res.json(pagos);
   } catch (error) {
@@ -1136,22 +1264,72 @@ app.post('/admin/crear-cliente-ficha/:fichaId', verificarToken, soloAdmin, async
     const existe = await UsuarioSistema.findOne({ email });
     if (existe) return res.status(400).json({ mensaje: 'Ya existe una cuenta con ese correo' });
 
-    const passwordTemporal = generarClaveTemporal();
-    const passwordHash = await bcrypt.hash(passwordTemporal, 10);
+    // Password aleatoria de relleno: nadie la usa, la cuenta se activa por link de correo
+    const passwordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
+    const activacionToken = crypto.randomBytes(24).toString('hex');
+    const activacionExpira = new Date(Date.now() + 72 * 60 * 60 * 1000);
 
     await new UsuarioSistema({
       nombre: ficha.apoderado.nombre || 'Apoderado',
       email,
       passwordHash,
       rol: 'cliente',
-      estado: 'activo',
+      estado: 'pendiente',
       debeCambiarPassword: true,
+      activacionToken,
+      activacionExpira,
     }).save();
 
-    res.status(201).json({ mensaje: 'Cuenta cliente creada', email, passwordTemporal });
+    const resultadoCorreo = await enviarCorreoActivacionApoderado(email, ficha.apoderado.nombre, activacionToken);
+
+    res.status(201).json({
+      mensaje: resultadoCorreo.enviado
+        ? 'Cuenta creada. Se envió un correo de activación al apoderado.'
+        : 'Cuenta creada, pero no se pudo enviar el correo automático (revisa la configuración de SMTP). Comparte este link manualmente:',
+      email,
+      correoEnviado: resultadoCorreo.enviado,
+      linkActivacion: `${process.env.FRONTEND_URL || 'https://www.captaciones.cl'}/activar-cuenta/${activacionToken}`,
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ mensaje: 'Error al crear cuenta cliente' });
+  }
+});
+
+/* Verifica un token de activación de cuenta (público, sin login) */
+app.get('/activar-cuenta/:token', async (req, res) => {
+  try {
+    const usuario = await UsuarioSistema.findOne({ activacionToken: req.params.token });
+    if (!usuario) return res.status(404).json({ mensaje: 'Link de activación inválido' });
+    if (usuario.activacionExpira < new Date()) return res.status(410).json({ mensaje: 'Este link ha expirado' });
+    res.json({ valido: true, email: usuario.email, nombre: usuario.nombre });
+  } catch (error) {
+    res.status(500).json({ mensaje: 'Error al validar el link' });
+  }
+});
+
+/* Activa la cuenta: confirma el correo y define la contraseña propia del apoderado */
+app.post('/activar-cuenta/:token', limiteLogin, async (req, res) => {
+  try {
+    const { passwordNueva } = req.body;
+    if (!passwordNueva || passwordNueva.length < 8) {
+      return res.status(400).json({ mensaje: 'La contraseña debe tener al menos 8 caracteres' });
+    }
+    const usuario = await UsuarioSistema.findOne({ activacionToken: req.params.token });
+    if (!usuario) return res.status(404).json({ mensaje: 'Link de activación inválido' });
+    if (usuario.activacionExpira < new Date()) return res.status(410).json({ mensaje: 'Este link ha expirado' });
+
+    usuario.passwordHash = await bcrypt.hash(passwordNueva, 10);
+    usuario.estado = 'activo';
+    usuario.debeCambiarPassword = false;
+    usuario.activacionToken = null;
+    usuario.activacionExpira = null;
+    await usuario.save();
+
+    res.json({ mensaje: 'Cuenta activada correctamente. Ya puedes iniciar sesión.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ mensaje: 'Error al activar la cuenta' });
   }
 });
 

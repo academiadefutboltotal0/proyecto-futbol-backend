@@ -5,6 +5,7 @@ const PartidoSchema = new mongoose.Schema({
   visitante:  { type: String, required: true },
   fecha:      { type: String },
   hora:       { type: String },
+  horaCitacion: { type: String },
   resultado:  { type: String, default: '' },
   sede:       { type: String },
   tipo:       { type: String, enum: ['proximo', 'resultado'], default: 'proximo' },
