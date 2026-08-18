@@ -564,13 +564,15 @@ app.post('/ficha-temporada', limiteRegistro, async (req, res) => {
     const errorLong = validarLongitudes(datos);
     if (errorLong) return res.status(400).json({ mensaje: errorLong });
 
+    let invitacion = null;
     if (invitacionToken) {
-      const inv = await Invitacion.findOne({ token: invitacionToken });
-      if (!inv) return res.status(404).json({ mensaje: 'Link inválido' });
-      if (inv.usado) return res.status(410).json({ mensaje: 'Este link ya fue utilizado' });
-      if (inv.expiraEn < new Date()) return res.status(410).json({ mensaje: 'Este link ha expirado' });
-      inv.usado = true;
-      await inv.save();
+      invitacion = await Invitacion.findOne({ token: invitacionToken });
+      if (!invitacion) return res.status(404).json({ mensaje: 'Link inválido' });
+      if (invitacion.usado) return res.status(410).json({ mensaje: 'Este link ya fue utilizado' });
+      if (invitacion.expiraEn < new Date()) return res.status(410).json({ mensaje: 'Este link ha expirado' });
+      // OJO: no se marca "usado" todavía — recién se marca al final, si la ficha se
+      // guarda con éxito. Así, si el RUT es inválido/duplicado, la familia puede
+      // corregir el dato y reenviar el mismo formulario sin necesitar un link nuevo.
     }
 
     // Normalizar payload del registro-invitado (estructura pupilo/apoderado)
@@ -627,6 +629,22 @@ app.post('/ficha-temporada', limiteRegistro, async (req, res) => {
 
     const ficha = new FichaTemporada(datos);
     await ficha.save();
+
+    if (invitacion) {
+      invitacion.usado = true;
+      await invitacion.save();
+    }
+
+    // Crea la cuenta del apoderado y le manda el correo de activación automáticamente.
+    // Si ya tiene cuenta (ej. está inscribiendo a un segundo hijo), no hace nada.
+    // Un fallo acá no debe hacer fallar el registro de la ficha, que ya se guardó bien.
+    if (ficha.apoderado?.correo) {
+      try {
+        await crearCuentaClienteConActivacion(ficha.apoderado.correo, ficha.apoderado.nombre);
+      } catch (errCorreo) {
+        console.error('No se pudo crear la cuenta cliente automáticamente:', errCorreo.message);
+      }
+    }
 
     res.status(201).json({
       mensaje: 'Ficha guardada correctamente',
@@ -1253,6 +1271,37 @@ app.get('/cliente/mis-fichas', verificarToken, async (req, res) => {
   }
 });
 
+/* Crea (si no existe) la cuenta cliente de un apoderado y le manda el correo de activación.
+   Se usa tanto desde el botón manual del admin como automáticamente al registrar una ficha. */
+async function crearCuentaClienteConActivacion(email, nombre) {
+  const existe = await UsuarioSistema.findOne({ email });
+  if (existe) return { creada: false, motivo: 'ya_existe' };
+
+  // Password aleatoria de relleno: nadie la usa, la cuenta se activa por link de correo
+  const passwordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
+  const activacionToken = crypto.randomBytes(24).toString('hex');
+  const activacionExpira = new Date(Date.now() + 72 * 60 * 60 * 1000);
+
+  await new UsuarioSistema({
+    nombre: nombre || 'Apoderado',
+    email,
+    passwordHash,
+    rol: 'cliente',
+    estado: 'pendiente',
+    debeCambiarPassword: true,
+    activacionToken,
+    activacionExpira,
+  }).save();
+
+  const resultadoCorreo = await enviarCorreoActivacionApoderado(email, nombre, activacionToken);
+
+  return {
+    creada: true,
+    correoEnviado: resultadoCorreo.enviado,
+    linkActivacion: `${process.env.FRONTEND_URL || 'https://www.captaciones.cl'}/activar-cuenta/${activacionToken}`,
+  };
+}
+
 app.post('/admin/crear-cliente-ficha/:fichaId', verificarToken, soloAdmin, async (req, res) => {
   try {
     const ficha = await FichaTemporada.findById(req.params.fichaId);
@@ -1261,34 +1310,16 @@ app.post('/admin/crear-cliente-ficha/:fichaId', verificarToken, soloAdmin, async
     const email = ficha.apoderado?.correo;
     if (!email) return res.status(400).json({ mensaje: 'La ficha no tiene correo de apoderado' });
 
-    const existe = await UsuarioSistema.findOne({ email });
-    if (existe) return res.status(400).json({ mensaje: 'Ya existe una cuenta con ese correo' });
-
-    // Password aleatoria de relleno: nadie la usa, la cuenta se activa por link de correo
-    const passwordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
-    const activacionToken = crypto.randomBytes(24).toString('hex');
-    const activacionExpira = new Date(Date.now() + 72 * 60 * 60 * 1000);
-
-    await new UsuarioSistema({
-      nombre: ficha.apoderado.nombre || 'Apoderado',
-      email,
-      passwordHash,
-      rol: 'cliente',
-      estado: 'pendiente',
-      debeCambiarPassword: true,
-      activacionToken,
-      activacionExpira,
-    }).save();
-
-    const resultadoCorreo = await enviarCorreoActivacionApoderado(email, ficha.apoderado.nombre, activacionToken);
+    const resultado = await crearCuentaClienteConActivacion(email, ficha.apoderado.nombre);
+    if (!resultado.creada) return res.status(400).json({ mensaje: 'Ya existe una cuenta con ese correo' });
 
     res.status(201).json({
-      mensaje: resultadoCorreo.enviado
+      mensaje: resultado.correoEnviado
         ? 'Cuenta creada. Se envió un correo de activación al apoderado.'
         : 'Cuenta creada, pero no se pudo enviar el correo automático (revisa la configuración de SMTP). Comparte este link manualmente:',
       email,
-      correoEnviado: resultadoCorreo.enviado,
-      linkActivacion: `${process.env.FRONTEND_URL || 'https://www.captaciones.cl'}/activar-cuenta/${activacionToken}`,
+      correoEnviado: resultado.correoEnviado,
+      linkActivacion: resultado.linkActivacion,
     });
   } catch (error) {
     console.error(error);
