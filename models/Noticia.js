@@ -6,6 +6,7 @@ const NoticiaSchema = new mongoose.Schema({
   contenido:  String,
   fecha:      String,
   imagenUrl:  String,
+  imagenPosicion: { type: String, default: '50% 50%' },
   categoria:  { type: String, enum: ['Entrenamiento', 'Partido', 'Evento'], default: 'Evento' },
 }, { timestamps: true });
 
