@@ -160,6 +160,8 @@ const InscripcionSchema = new mongoose.Schema({
     genero: Object,
     direccion: String,
     comuna: Object,
+    sede: String,
+    horarioSede: String,
   },
   estado: {
     type: String,
