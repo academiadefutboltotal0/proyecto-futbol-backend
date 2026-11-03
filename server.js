@@ -479,7 +479,16 @@ app.get('/', (req, res) => {
   res.send('Servidor funcionando');
 });
 
-app.get('/noticias', async (req, res) => {
+/* Cache del navegador en rutas públicas de solo lectura: evita que cada carga de la
+   página de inicio vuelva a pedirle lo mismo al servidor (importante ante picos de
+   visitas, ej. el día del lanzamiento). El admin sigue viendo cambios casi al instante
+   porque son 2 minutos, no horas. */
+const cachePublica = (req, res, next) => {
+  res.set('Cache-Control', 'public, max-age=120');
+  next();
+};
+
+app.get('/noticias', cachePublica, async (req, res) => {
   try {
     const noticias = await Noticia.find().sort({ createdAt: -1 });
     res.json(noticias);
@@ -488,7 +497,7 @@ app.get('/noticias', async (req, res) => {
   }
 });
 
-app.get('/config', async (req, res) => {
+app.get('/config', cachePublica, async (req, res) => {
   try {
     const config = await getConfig();
     res.json(config);
@@ -498,7 +507,7 @@ app.get('/config', async (req, res) => {
 });
 
 /* Partidos (GET público, resto protegido) */
-app.get('/partidos', async (req, res) => {
+app.get('/partidos', cachePublica, async (req, res) => {
   try {
     const data = await Partido.find().sort({ fecha: 1 });
     res.json(data);
