@@ -6,7 +6,8 @@ const SiteConfigSchema = new mongoose.Schema({
   tituloBienvenida:    { type: String, default: '¡Bienvenidos Crack!' },
   subtituloBienvenida: { type: String, default: 'Revisa las últimas novedades de tu club.' },
   imagenDestacada:     { type: String, default: '' },
-  imagenesCarrusel:    { type: [String], default: [] },
+  // Mixed: formato viejo era solo string (url); ahora es { url, modo, posicion, blur, color }.
+  imagenesCarrusel:    { type: [mongoose.Schema.Types.Mixed], default: [] },
   imagenesGaleria:     { type: [{ url: String, descripcion: String }], default: [] },
   mostrarPopup:        { type: Boolean, default: false },
   imagenPopup:         { type: String, default: '' },
