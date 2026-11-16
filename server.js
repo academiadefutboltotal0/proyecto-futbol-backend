@@ -15,7 +15,7 @@ const UsuarioSistema = require('./models/UsuarioSistema');
 const bcrypt = require('bcrypt');
 const Asistencia = require('./models/Asistencia');
 const Rendimiento = require('./models/Rendimiento');
-const { enviarCorreoActivacionApoderado } = require('./mailer');
+const { enviarCorreoActivacionApoderado, enviarCorreoPagoAprobado, enviarCorreoPagoRechazado } = require('./mailer');
 
 if (!process.env.MONGODB_URI) {
   console.error('❌ Falta MONGODB_URI en las variables de entorno');
@@ -651,7 +651,7 @@ app.post('/ficha-temporada', limiteRegistro, async (req, res) => {
     // Un fallo acá no debe hacer fallar el registro de la ficha, que ya se guardó bien.
     if (ficha.apoderado?.correo) {
       try {
-        await crearCuentaClienteConActivacion(ficha.apoderado.correo, ficha.apoderado.nombre);
+        await crearCuentaClienteConActivacion(ficha.apoderado.correo, ficha.apoderado.nombre, ficha.sede);
       } catch (errCorreo) {
         console.error('No se pudo crear la cuenta cliente automáticamente:', errCorreo.message);
       }
@@ -1148,27 +1148,45 @@ app.patch('/pagos/:id/estado', verificarToken, soloAdmin, async (req, res) => {
       return res.status(404).json({ mensaje: 'Pago no encontrado' });
     }
 
-    if (estado === 'aprobado') {
-      let fichaId = pagoActualizado.fichaId;
-      if (!fichaId) {
-        const match = (pagoActualizado.alumno || '').match(/\(([^)]+)\)/);
-        if (match) {
-          const cedula = match[1].trim();
-          if (cedula && cedula !== 'sin RUT') {
-            const ficha = await FichaTemporada.findOne({ cedula });
-            if (ficha) fichaId = ficha._id;
-          }
+    let fichaId = pagoActualizado.fichaId;
+    if (!fichaId) {
+      const match = (pagoActualizado.alumno || '').match(/\(([^)]+)\)/);
+      if (match) {
+        const cedula = match[1].trim();
+        if (cedula && cedula !== 'sin RUT') {
+          const ficha = await FichaTemporada.findOne({ cedula });
+          if (ficha) fichaId = ficha._id;
         }
       }
-      if (fichaId) {
-        const fechaPago = pagoActualizado.fecha ? new Date(pagoActualizado.fecha) : new Date();
-        const mes = fechaPago.getMonth() + 1;
-        const año = fechaPago.getFullYear();
-        await PagoMensual.findOneAndUpdate(
-          { fichaId, mes, año },
-          { estado: 'pagado', fechaPago: new Date(), observacion: 'Aprobado por voucher' },
-          { upsert: true, returnDocument: 'after' }
-        );
+    }
+
+    const NOMBRES_MES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+
+    if (estado === 'aprobado' && fichaId) {
+      const fechaPago = pagoActualizado.fecha ? new Date(pagoActualizado.fecha) : new Date();
+      const mes = fechaPago.getMonth() + 1;
+      const año = fechaPago.getFullYear();
+      await PagoMensual.findOneAndUpdate(
+        { fichaId, mes, año },
+        { estado: 'pagado', fechaPago: new Date(), observacion: 'Aprobado por voucher' },
+        { upsert: true, returnDocument: 'after' }
+      );
+    }
+
+    if ((estado === 'aprobado' || estado === 'rechazado') && fichaId) {
+      try {
+        const ficha = await FichaTemporada.findById(fichaId);
+        const correo = ficha?.apoderado?.correo;
+        if (correo) {
+          if (estado === 'aprobado') {
+            const fechaPago = pagoActualizado.fecha ? new Date(pagoActualizado.fecha) : new Date();
+            await enviarCorreoPagoAprobado(correo, ficha.apoderado.nombre, ficha.nombre, NOMBRES_MES[fechaPago.getMonth()], fechaPago.getFullYear());
+          } else {
+            await enviarCorreoPagoRechazado(correo, ficha.apoderado.nombre, ficha.nombre);
+          }
+        }
+      } catch (errCorreo) {
+        console.error('No se pudo enviar el correo de estado de pago:', errCorreo.message);
       }
     }
 
@@ -1284,7 +1302,7 @@ app.get('/cliente/mis-fichas', verificarToken, async (req, res) => {
 
 /* Crea (si no existe) la cuenta cliente de un apoderado y le manda el correo de activación.
    Se usa tanto desde el botón manual del admin como automáticamente al registrar una ficha. */
-async function crearCuentaClienteConActivacion(email, nombre) {
+async function crearCuentaClienteConActivacion(email, nombre, sede) {
   const existe = await UsuarioSistema.findOne({ email });
   if (existe) return { creada: false, motivo: 'ya_existe' };
 
@@ -1304,7 +1322,13 @@ async function crearCuentaClienteConActivacion(email, nombre) {
     activacionExpira,
   }).save();
 
-  const resultadoCorreo = await enviarCorreoActivacionApoderado(email, nombre, activacionToken);
+  let whatsappLink = '';
+  if (sede) {
+    const config = await getConfig();
+    whatsappLink = config.whatsappPorSede?.find((w) => w.sede === sede)?.link || '';
+  }
+
+  const resultadoCorreo = await enviarCorreoActivacionApoderado(email, nombre, activacionToken, whatsappLink);
 
   return {
     creada: true,
@@ -1321,7 +1345,7 @@ app.post('/admin/crear-cliente-ficha/:fichaId', verificarToken, soloAdmin, async
     const email = ficha.apoderado?.correo;
     if (!email) return res.status(400).json({ mensaje: 'La ficha no tiene correo de apoderado' });
 
-    const resultado = await crearCuentaClienteConActivacion(email, ficha.apoderado.nombre);
+    const resultado = await crearCuentaClienteConActivacion(email, ficha.apoderado.nombre, ficha.sede);
     if (!resultado.creada) return res.status(400).json({ mensaje: 'Ya existe una cuenta con ese correo' });
 
     res.status(201).json({
